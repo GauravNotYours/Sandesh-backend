@@ -44,7 +44,16 @@ function parseAllowedOrigins(value) {
     new Set(
       raw
         .split(',')
-        .map((item) => item.trim())
+        .map((item) => {
+          const normalized = String(item || '').trim()
+          if (!normalized || normalized === '*') return normalized
+
+          try {
+            return new URL(normalized).origin
+          } catch {
+            return normalized.replace(/\/+$/, '')
+          }
+        })
         .filter(Boolean),
     ),
   )
@@ -104,24 +113,34 @@ app.use(
 
 // --------- CORS (frontend/back can be on different domains) ----------
 const allowAnyOrigin = allowedCorsOrigins.includes('*')
-app.use(
-  cors({
-    origin:
-      allowAnyOrigin
-        ? true
-        : (origin, callback) => {
-            // Allow non-browser clients (no Origin header)
-            if (!origin) return callback(null, true)
-            if (allowedCorsOrigins.includes(origin)) {
-              return callback(null, true)
+const corsOptions = {
+  origin:
+    allowAnyOrigin
+      ? true
+      : (origin, callback) => {
+          // Allow non-browser clients (no Origin header)
+          if (!origin) return callback(null, true)
+
+          const normalizedOrigin = (() => {
+            try {
+              return new URL(String(origin)).origin
+            } catch {
+              return String(origin).replace(/\/+$/, '')
             }
-            return callback(new Error('Not allowed by CORS'), false)
-          },
-    credentials: false,
-    methods: ['GET', 'HEAD', 'POST', 'DELETE', 'OPTIONS'],
-    allowedHeaders: ['Authorization', 'Content-Type'],
-  }),
-)
+          })()
+
+          if (allowedCorsOrigins.includes(normalizedOrigin)) {
+            return callback(null, true)
+          }
+
+          return callback(new Error('Not allowed by CORS'), false)
+        },
+  credentials: false,
+  methods: ['GET', 'HEAD', 'POST', 'DELETE', 'OPTIONS'],
+  allowedHeaders: ['Authorization', 'Content-Type'],
+}
+app.use(cors(corsOptions))
+app.options('*', cors(corsOptions))
 
 // --------- MongoDB ----------
 mongoose.set('strictQuery', true)
