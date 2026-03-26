@@ -159,7 +159,14 @@ const userSchema = new mongoose.Schema(
 
 const chatMessageSchema = new mongoose.Schema(
   {
-    text: { type: String, required: true, maxlength: CONST.MAX_TEXT_LENGTH || 600 },
+    text: {
+      type: String,
+      required() {
+        return !this.isDeleted
+      },
+      maxlength: CONST.MAX_TEXT_LENGTH || 600,
+      default: '',
+    },
     senderId: { type: mongoose.Schema.Types.ObjectId, ref: 'User', required: true },
     senderUsername: { type: String, required: true },
     isDeleted: { type: Boolean, default: false },
