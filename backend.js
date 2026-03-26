@@ -14,6 +14,7 @@ const { Server } = require('socket.io')
 const { body, validationResult } = require('express-validator')
 
 const app = express()
+const isProduction = process.env.NODE_ENV === 'production'
 
 // Socket.io instance (only created when running the backend as a persistent server).
 let ioInstance = null
@@ -35,8 +36,59 @@ try {
 // Load CONST after dotenv so values like MONGODB_URI/JWT_SECRET are available.
 const CONST = require('./CONST')
 
+function parseAllowedOrigins(value) {
+  const raw = String(value || '').trim()
+  if (!raw || raw === '*') return ['*']
+
+  return Array.from(
+    new Set(
+      raw
+        .split(',')
+        .map((item) => item.trim())
+        .filter(Boolean),
+    ),
+  )
+}
+
+function isMissingOrPlaceholder(value, placeholders = []) {
+  const normalized = String(value || '').trim()
+  if (!normalized) return true
+
+  return placeholders.some((placeholder) => normalized === placeholder)
+}
+
+function validateRuntimeConfig() {
+  if (!isProduction) return
+
+  const invalidKeys = []
+
+  if (
+    isMissingOrPlaceholder(CONST.MONGODB_URI, ['PASTE_MONGODB_CONNECTION_STRING_HERE'])
+  ) {
+    invalidKeys.push('MONGODB_URI')
+  }
+
+  if (isMissingOrPlaceholder(CONST.JWT_SECRET, ['CHANGE_ME_JWT_SECRET'])) {
+    invalidKeys.push('JWT_SECRET')
+  }
+
+  if (parseAllowedOrigins(CONST.CORS_ORIGIN).includes('*')) {
+    invalidKeys.push('CORS_ORIGIN')
+  }
+
+  if (invalidKeys.length) {
+    throw new Error(
+      `Invalid production configuration. Set secure values for: ${invalidKeys.join(', ')}`,
+    )
+  }
+}
+
+validateRuntimeConfig()
+const allowedCorsOrigins = parseAllowedOrigins(CONST.CORS_ORIGIN)
+
 // --------- Basic security headers / hardening ----------
 app.disable('x-powered-by')
+app.set('trust proxy', 1)
 app.use(
   helmet({
     // Vercel/serverless + dynamic origins can make CSP tricky.
@@ -51,21 +103,23 @@ app.use(
 )
 
 // --------- CORS (frontend/back can be on different domains) ----------
-const corsOrigin = CONST.CORS_ORIGIN || '*'
+const allowAnyOrigin = allowedCorsOrigins.includes('*')
 app.use(
   cors({
     origin:
-      corsOrigin === '*'
+      allowAnyOrigin
         ? true
         : (origin, callback) => {
             // Allow non-browser clients (no Origin header)
             if (!origin) return callback(null, true)
-            if (corsOrigin.split(',').map((s) => s.trim()).includes(origin)) {
+            if (allowedCorsOrigins.includes(origin)) {
               return callback(null, true)
             }
             return callback(new Error('Not allowed by CORS'), false)
           },
     credentials: false,
+    methods: ['GET', 'HEAD', 'POST', 'DELETE', 'OPTIONS'],
+    allowedHeaders: ['Authorization', 'Content-Type'],
   }),
 )
 
@@ -117,8 +171,17 @@ async function seedAdmin() {
   if (existing) return
 
   const adminPassword = String(CONST.ADMIN_PASSWORD || '')
-  if (!adminPassword || adminPassword.includes('CHANGE_ME')) {
-    // Still seed (so the server runs), but warn heavily.
+  const hasUnsafeAdminPassword =
+    !adminPassword ||
+    adminPassword.includes('CHANGE_ME') ||
+    adminPassword === 'password'
+
+  if (hasUnsafeAdminPassword && isProduction) {
+    throw new Error('ADMIN_PASSWORD must be set to a secure value before seeding the admin user')
+  }
+
+  if (hasUnsafeAdminPassword) {
+    // Still seed in development so the server runs, but warn heavily.
     console.warn(
       'WARNING: ADMIN_PASSWORD is not set (still using placeholder). Please update CONST.js env vars before production.',
     )
@@ -160,6 +223,23 @@ function pickUserSummary(u) {
   }
 }
 
+function asyncHandler(handler) {
+  return (req, res, next) => {
+    Promise.resolve(handler(req, res, next)).catch(next)
+  }
+}
+
+const ensureDbReady = asyncHandler(async (req, res, next) => {
+  try {
+    await initDb()
+    return next()
+  } catch (err) {
+    err.status = 503
+    err.safeMessage = 'Database unavailable'
+    throw err
+  }
+})
+
 function authMiddleware(req, res, next) {
   const auth = req.headers.authorization || ''
   const m = auth.match(/^Bearer\s+(.+)$/i)
@@ -174,7 +254,7 @@ function authMiddleware(req, res, next) {
   }
 }
 
-async function loadUserMiddleware(req, res, next) {
+const loadUserMiddleware = asyncHandler(async (req, res, next) => {
   try {
     const userId = req.auth?.sub
     const u = await User.findById(userId).select('-passwordHash').lean()
@@ -187,7 +267,7 @@ async function loadUserMiddleware(req, res, next) {
   } catch {
     return res.status(401).json({ message: 'Auth failed' })
   }
-}
+})
 
 function requireAdmin(req, res, next) {
   if (req.user?.role !== 'admin') return res.status(403).json({ message: 'Admin only' })
@@ -251,7 +331,22 @@ async function createMessageFromPayload({ user, text, replyToId }) {
 }
 
 // --------- Routes ----------
-app.get('/api/health', (req, res) => res.json({ ok: true }))
+app.get('/api/health', (req, res) =>
+  res.json({
+    ok: true,
+    service: 'sandesh-backend',
+    realtimeMode: ioInstance ? 'websocket' : 'polling',
+    dbReady: mongoose.connection.readyState === 1,
+  }),
+)
+app.get('/api', (req, res) =>
+  res.json({
+    ok: true,
+    message: 'Sandesh backend is running',
+    health: '/api/health',
+  }),
+)
+app.use('/api', ensureDbReady)
 
 // --------- Auth ----------
 const loginLimiter = rateLimit({
@@ -268,7 +363,7 @@ app.post(
     body('username').isString().trim().isLength({ min: 3, max: 30 }),
     body('password').isString().isLength({ min: 6, max: 100 }),
   ],
-  async (req, res) => {
+  asyncHandler(async (req, res) => {
     const errors = validationResult(req)
     if (!errors.isEmpty()) {
       return res.status(400).json({ errors: errors.array() })
@@ -294,7 +389,7 @@ app.post(
     )
 
     return res.json({ token, user: pickUserSummary(u) })
-  },
+  }),
 )
 
 app.get('/api/auth/me', authMiddleware, loadUserMiddleware, (req, res) => {
@@ -302,23 +397,29 @@ app.get('/api/auth/me', authMiddleware, loadUserMiddleware, (req, res) => {
 })
 
 // --------- Admin ----------
-app.get('/api/admin/users', authMiddleware, loadUserMiddleware, requireAdmin, async (req, res) => {
-  const users = await User.find()
-    .select('_id username usernameLower role isBanned bannedAt createdAt')
-    .sort({ createdAt: -1 })
-    .lean()
+app.get(
+  '/api/admin/users',
+  authMiddleware,
+  loadUserMiddleware,
+  requireAdmin,
+  asyncHandler(async (req, res) => {
+    const users = await User.find()
+      .select('_id username usernameLower role isBanned bannedAt createdAt')
+      .sort({ createdAt: -1 })
+      .lean()
 
-  return res.json({
-    users: users.map((u) => ({
-      id: u._id.toString(),
-      username: u.username,
-      role: u.role,
-      isBanned: u.isBanned,
-      bannedAt: u.bannedAt,
-      createdAt: u.createdAt,
-    })),
-  })
-})
+    return res.json({
+      users: users.map((u) => ({
+        id: u._id.toString(),
+        username: u.username,
+        role: u.role,
+        isBanned: u.isBanned,
+        bannedAt: u.bannedAt,
+        createdAt: u.createdAt,
+      })),
+    })
+  }),
+)
 
 app.post(
   '/api/admin/create-user',
@@ -330,7 +431,7 @@ app.post(
     body('password').isString().isLength({ min: 6, max: 100 }),
     body('role').optional().isIn(['admin', 'user']),
   ],
-  async (req, res) => {
+  asyncHandler(async (req, res) => {
     const errors = validationResult(req)
     if (!errors.isEmpty()) return res.status(400).json({ errors: errors.array() })
 
@@ -361,7 +462,7 @@ app.post(
     })
 
     return res.json({ user: pickUserSummary(created) })
-  },
+  }),
 )
 
 app.post(
@@ -373,7 +474,7 @@ app.post(
     body('userId').isString().isLength({ min: 10 }),
     body('banned').isBoolean(),
   ],
-  async (req, res) => {
+  asyncHandler(async (req, res) => {
     const errors = validationResult(req)
     if (!errors.isEmpty()) return res.status(400).json({ errors: errors.array() })
 
@@ -406,7 +507,7 @@ app.post(
     }
 
     return res.json({ ok: true })
-  },
+  }),
 )
 
 app.delete(
@@ -414,7 +515,7 @@ app.delete(
   authMiddleware,
   loadUserMiddleware,
   requireAdmin,
-  async (req, res) => {
+  asyncHandler(async (req, res) => {
     const userId = req.params.id
 
     const viparyasUser = await User.findOne({
@@ -430,7 +531,7 @@ app.delete(
 
     await u.deleteOne()
     return res.json({ ok: true })
-  },
+  }),
 )
 
 app.post(
@@ -442,7 +543,7 @@ app.post(
     body('userId').isString().isLength({ min: 10 }),
     body('newPassword').isString().isLength({ min: 6, max: 100 }),
   ],
-  async (req, res) => {
+  asyncHandler(async (req, res) => {
     const errors = validationResult(req)
     if (!errors.isEmpty()) return res.status(400).json({ errors: errors.array() })
 
@@ -462,7 +563,7 @@ app.post(
     await u.save()
 
     return res.json({ ok: true })
-  },
+  }),
 )
 
 // --------- Chat (text-only) ----------
@@ -470,7 +571,7 @@ app.get(
   '/api/chat/messages',
   authMiddleware,
   loadUserMiddleware,
-  async (req, res) => {
+  asyncHandler(async (req, res) => {
     const limit = CONST.MESSAGE_LIMIT || 100
     const sinceRaw = req.query.since
 
@@ -485,7 +586,11 @@ app.get(
       }
     }
 
-    const filter = sinceDate ? { createdAt: { $gt: sinceDate } } : {}
+    const filter = sinceDate
+      ? {
+          $or: [{ createdAt: { $gt: sinceDate } }, { deletedAt: { $gt: sinceDate } }],
+        }
+      : {}
     const messagesDesc = await ChatMessage.find(filter)
       .sort({ createdAt: -1 }) // newest -> oldest (we reverse below)
       .limit(limit)
@@ -507,7 +612,7 @@ app.get(
         createdAt: m.createdAt,
       })),
     })
-  },
+  }),
 )
 
 app.post(
@@ -518,7 +623,7 @@ app.post(
     body('text').isString().isLength({ min: 1, max: CONST.MAX_TEXT_LENGTH || 600 }),
     body('replyToId').optional().isString().isLength({ min: 10 }),
   ],
-  async (req, res) => {
+  asyncHandler(async (req, res) => {
     const errors = validationResult(req)
     if (!errors.isEmpty()) return res.status(400).json({ errors: errors.array() })
 
@@ -560,14 +665,14 @@ app.post(
         createdAt: created.createdAt,
       },
     })
-  },
+  }),
 )
 
 app.delete(
   '/api/chat/messages/:id',
   authMiddleware,
   loadUserMiddleware,
-  async (req, res) => {
+  asyncHandler(async (req, res) => {
     const messageId = req.params.id
     const msg = await ChatMessage.findById(messageId)
     if (!msg) return res.status(404).json({ message: 'Message not found' })
@@ -595,8 +700,30 @@ app.delete(
 
     if (ioInstance) ioInstance.emit('chat:deleted', payload)
     return res.json({ ok: true, message: payload })
-  },
+  }),
 )
+
+app.use('/api', (req, res) => {
+  return res.status(404).json({ message: 'Route not found' })
+})
+
+app.use((err, req, res, next) => {
+  const status = Number(err?.status) || 500
+  const code = err?.code
+  const safeMessage =
+    err?.safeMessage ||
+    (status < 500 ? err?.message || 'Request failed' : 'Internal server error')
+
+  if (status >= 500) {
+    // eslint-disable-next-line no-console
+    console.error(err)
+  }
+
+  return res.status(status).json({
+    message: safeMessage,
+    ...(code ? { code } : {}),
+  })
+})
 
 // --------- Bootstrap ----------
 let initPromise = null
@@ -624,7 +751,7 @@ if (require.main === module) {
       const server = http.createServer(app)
       const io = new Server(server, {
         cors: {
-          origin: CONST.CORS_ORIGIN === '*' ? '*' : CONST.CORS_ORIGIN.split(',').map((s) => s.trim()),
+          origin: allowAnyOrigin ? '*' : allowedCorsOrigins,
           methods: ['GET', 'POST'],
         },
       })
