@@ -15,6 +15,12 @@ const { body, validationResult } = require('express-validator')
 
 const app = express()
 const isProduction = process.env.NODE_ENV === 'production'
+const mongoBootstrapState = global.__sandeshMongoBootstrap || {
+  seededAdmin: false,
+  promise: null,
+}
+
+global.__sandeshMongoBootstrap = mongoBootstrapState
 
 // Socket.io instance (only created when running the backend as a persistent server).
 let ioInstance = null
@@ -144,6 +150,7 @@ app.options('*', cors(corsOptions))
 
 // --------- MongoDB ----------
 mongoose.set('strictQuery', true)
+mongoose.set('bufferCommands', false)
 
 const userSchema = new mongoose.Schema(
   {
@@ -752,16 +759,66 @@ app.use((err, req, res, next) => {
 })
 
 // --------- Bootstrap ----------
-let initPromise = null
 async function initDb() {
-  if (!initPromise) {
-    initPromise = (async () => {
-      await mongoose.connect(CONST.MONGODB_URI)
+  if (mongoose.connection.readyState === 1) {
+    if (!mongoBootstrapState.seededAdmin) {
       await seedAdmin()
-      return true
-    })()
+      mongoBootstrapState.seededAdmin = true
+    }
+    return true
   }
-  return initPromise
+
+  if (mongoBootstrapState.promise) {
+    return mongoBootstrapState.promise
+  }
+
+  mongoBootstrapState.promise = (async () => {
+    try {
+      if (mongoose.connection.readyState === 0) {
+        await mongoose.connect(CONST.MONGODB_URI, {
+          serverSelectionTimeoutMS: Number(
+            process.env.MONGODB_SERVER_SELECTION_TIMEOUT_MS || 10000,
+          ),
+          socketTimeoutMS: Number(process.env.MONGODB_SOCKET_TIMEOUT_MS || 20000),
+          maxPoolSize: Number(process.env.MONGODB_MAX_POOL_SIZE || 10),
+        })
+      } else if (mongoose.connection.readyState === 3) {
+        // If a previous attempt is still disconnecting, wait for it to settle.
+        await new Promise((resolve) => {
+          mongoose.connection.once('disconnected', resolve)
+        })
+        await mongoose.connect(CONST.MONGODB_URI, {
+          serverSelectionTimeoutMS: Number(
+            process.env.MONGODB_SERVER_SELECTION_TIMEOUT_MS || 10000,
+          ),
+          socketTimeoutMS: Number(process.env.MONGODB_SOCKET_TIMEOUT_MS || 20000),
+          maxPoolSize: Number(process.env.MONGODB_MAX_POOL_SIZE || 10),
+        })
+      }
+
+      if (!mongoBootstrapState.seededAdmin) {
+        await seedAdmin()
+        mongoBootstrapState.seededAdmin = true
+      }
+
+      return true
+    } catch (err) {
+      mongoBootstrapState.promise = null
+      mongoBootstrapState.seededAdmin = false
+
+      if (mongoose.connection.readyState !== 0) {
+        try {
+          await mongoose.disconnect()
+        } catch {
+          // ignore cleanup failures
+        }
+      }
+
+      throw err
+    }
+  })()
+
+  return mongoBootstrapState.promise
 }
 
 // Eagerly start DB init so serverless handlers (that import this module)
