@@ -191,6 +191,7 @@ const chatMessageSchema = new mongoose.Schema(
 )
 
 chatMessageSchema.index({ createdAt: 1 })
+chatMessageSchema.index({ deletedAt: 1 })
 
 const User = mongoose.models.User || mongoose.model('User', userSchema)
 const ChatMessage =
@@ -256,6 +257,17 @@ function pickUserSummary(u) {
   }
 }
 
+function formatAdminUser(u) {
+  return {
+    id: u._id.toString(),
+    username: u.username,
+    role: u.role,
+    isBanned: !!u.isBanned,
+    bannedAt: u.bannedAt || null,
+    createdAt: u.createdAt || null,
+  }
+}
+
 function asyncHandler(handler) {
   return (req, res, next) => {
     Promise.resolve(handler(req, res, next)).catch(next)
@@ -290,7 +302,7 @@ function authMiddleware(req, res, next) {
 const loadUserMiddleware = asyncHandler(async (req, res, next) => {
   try {
     const userId = req.auth?.sub
-    const u = await User.findById(userId).select('-passwordHash').lean()
+    const u = await User.findById(userId).select('_id username role isBanned').lean()
     if (!u) return res.status(401).json({ message: 'User not found' })
     req.user = u
     if (u.isBanned) {
@@ -313,7 +325,7 @@ function sanitizeText(input) {
   return xss(s, { whiteList: [] }).trim().replace(/\s+/g, ' ')
 }
 
-function formatChatMessage(m) {
+function formatChatMessage(m, extras = {}) {
   const isDeleted = !!m.isDeleted
   return {
     id: m._id.toString(),
@@ -326,7 +338,13 @@ function formatChatMessage(m) {
     replyToText: m.replyToText,
     replyToSenderUsername: m.replyToSenderUsername,
     createdAt: m.createdAt,
+    clientRequestId: extras.clientRequestId || null,
   }
+}
+
+function normalizeClientRequestId(value) {
+  const normalized = String(value || '').trim()
+  return normalized ? normalized.slice(0, 64) : null
 }
 
 async function createMessageFromPayload({ user, text, replyToId }) {
@@ -442,14 +460,7 @@ app.get(
       .lean()
 
     return res.json({
-      users: users.map((u) => ({
-        id: u._id.toString(),
-        username: u.username,
-        role: u.role,
-        isBanned: u.isBanned,
-        bannedAt: u.bannedAt,
-        createdAt: u.createdAt,
-      })),
+      users: users.map((u) => formatAdminUser(u)),
     })
   }),
 )
@@ -494,7 +505,11 @@ app.post(
       isBanned: false,
     })
 
-    return res.json({ user: pickUserSummary(created) })
+    return res.json({
+      ok: true,
+      message: `User "${created.username}" created successfully`,
+      user: formatAdminUser(created),
+    })
   }),
 )
 
@@ -539,7 +554,11 @@ app.post(
       }
     }
 
-    return res.json({ ok: true })
+    return res.json({
+      ok: true,
+      message: `User "${u.username}" ${banned ? 'banned' : 'unbanned'} successfully`,
+      user: formatAdminUser(u),
+    })
   }),
 )
 
@@ -562,8 +581,22 @@ app.delete(
     const u = await User.findById(userId)
     if (!u) return res.status(404).json({ message: 'User not found' })
 
+    if (ioInstance) {
+      const socketIdSet = socketsByUserId.get(String(userId))
+      if (socketIdSet?.size) {
+        for (const sid of socketIdSet) {
+          ioInstance.sockets.sockets.get(sid)?.disconnect(true)
+        }
+      }
+    }
+
     await u.deleteOne()
-    return res.json({ ok: true })
+    return res.json({
+      ok: true,
+      message: `User "${u.username}" deleted successfully`,
+      userId: String(userId),
+      username: u.username,
+    })
   }),
 )
 
@@ -595,7 +628,11 @@ app.post(
     u.passwordHash = await bcrypt.hash(String(newPassword), CONST.BCRYPT_ROUNDS)
     await u.save()
 
-    return res.json({ ok: true })
+    return res.json({
+      ok: true,
+      message: `Password reset for "${u.username}" completed successfully`,
+      user: formatAdminUser(u),
+    })
   }),
 )
 
@@ -625,6 +662,9 @@ app.get(
         }
       : {}
     const messagesDesc = await ChatMessage.find(filter)
+      .select(
+        '_id text senderId senderUsername isDeleted deletedAt replyToMessageId replyToText replyToSenderUsername createdAt',
+      )
       .sort({ createdAt: -1 }) // newest -> oldest (we reverse below)
       .limit(limit)
       .lean()
@@ -632,18 +672,7 @@ app.get(
     const messages = messagesDesc.reverse()
 
     return res.json({
-      messages: messages.map((m) => ({
-        id: m._id.toString(),
-        text: m.isDeleted ? '' : m.text,
-        senderId: m.senderId?.toString(),
-        senderUsername: m.senderUsername,
-        isDeleted: !!m.isDeleted,
-        deletedAt: m.deletedAt || null,
-        replyToMessageId: m.replyToMessageId ? m.replyToMessageId.toString() : null,
-        replyToText: m.replyToText,
-        replyToSenderUsername: m.replyToSenderUsername,
-        createdAt: m.createdAt,
-      })),
+      messages: messages.map((m) => formatChatMessage(m)),
     })
   }),
 )
@@ -655,6 +684,7 @@ app.post(
   [
     body('text').isString().isLength({ min: 1, max: CONST.MAX_TEXT_LENGTH || 600 }),
     body('replyToId').optional().isString().isLength({ min: 10 }),
+    body('clientRequestId').optional().isString().isLength({ min: 1, max: 64 }),
   ],
   asyncHandler(async (req, res) => {
     const errors = validationResult(req)
@@ -663,6 +693,7 @@ app.post(
     const text = sanitizeText(req.body.text)
     if (!text) return res.status(400).json({ message: 'Text is required' })
 
+    const clientRequestId = normalizeClientRequestId(req.body.clientRequestId)
     const replyToIdRaw = req.body.replyToId
     let replyTo = null
     if (replyToIdRaw) {
@@ -681,23 +712,14 @@ app.post(
 
     await trimMessagesToLimit()
 
+    const formattedMessage = formatChatMessage(created, { clientRequestId })
+
     // Real-time: broadcast to all connected websocket clients (persistent server mode).
     if (ioInstance) {
-      ioInstance.emit('chat:newMessage', formatChatMessage(created))
+      ioInstance.emit('chat:newMessage', formattedMessage)
     }
 
-    return res.json({
-      message: {
-        id: created._id.toString(),
-        text: created.text,
-        senderId: created.senderId.toString(),
-        senderUsername: created.senderUsername,
-        replyToMessageId: created.replyToMessageId ? created.replyToMessageId.toString() : null,
-        replyToText: created.replyToText,
-        replyToSenderUsername: created.replyToSenderUsername,
-        createdAt: created.createdAt,
-      },
-    })
+    return res.json({ message: formattedMessage })
   }),
 )
 
@@ -908,16 +930,18 @@ if (require.main === module) {
             const user = socket.user
             const text = payload?.text
             const replyToId = payload?.replyToId || null
+            const clientRequestId = normalizeClientRequestId(payload?.clientRequestId)
 
             const created = await createMessageFromPayload({
               user,
               text,
               replyToId,
             })
+            const formattedMessage = formatChatMessage(created, { clientRequestId })
 
             // Broadcast to everyone.
-            ioInstance.emit('chat:newMessage', formatChatMessage(created))
-            if (ack) ack({ ok: true, message: formatChatMessage(created) })
+            ioInstance.emit('chat:newMessage', formattedMessage)
+            if (ack) ack({ ok: true, message: formattedMessage })
           } catch (err) {
             if (ack) ack({ ok: false, message: err?.message || 'Failed to send' })
           }
