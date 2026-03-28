@@ -19,8 +19,14 @@ const mongoBootstrapState = global.__sandeshMongoBootstrap || {
   seededAdmin: false,
   promise: null,
 }
+const messageTrimState = global.__sandeshMessageTrim || {
+  timer: null,
+  running: false,
+  rerunRequested: false,
+}
 
 global.__sandeshMongoBootstrap = mongoBootstrapState
+global.__sandeshMessageTrim = messageTrimState
 
 // Socket.io instance (only created when running the backend as a persistent server).
 let ioInstance = null
@@ -248,6 +254,43 @@ async function trimMessagesToLimit() {
   await ChatMessage.deleteMany({ _id: { $in: ids } })
 }
 
+function runTrimMessagesToLimit() {
+  if (messageTrimState.running) {
+    messageTrimState.rerunRequested = true
+    return
+  }
+
+  messageTrimState.running = true
+
+  Promise.resolve()
+    .then(() => trimMessagesToLimit())
+    .catch((err) => {
+      // eslint-disable-next-line no-console
+      console.error('Message trim failed:', err?.message || err)
+    })
+    .finally(() => {
+      messageTrimState.running = false
+
+      if (messageTrimState.rerunRequested) {
+        messageTrimState.rerunRequested = false
+        scheduleTrimMessagesToLimit(250)
+      }
+    })
+}
+
+function scheduleTrimMessagesToLimit(delayMs = 400) {
+  if (messageTrimState.timer) return
+
+  messageTrimState.timer = setTimeout(() => {
+    messageTrimState.timer = null
+    runTrimMessagesToLimit()
+  }, delayMs)
+
+  if (typeof messageTrimState.timer?.unref === 'function') {
+    messageTrimState.timer.unref()
+  }
+}
+
 function pickUserSummary(u) {
   return {
     id: u._id.toString(),
@@ -377,7 +420,7 @@ async function createMessageFromPayload({ user, text, replyToId }) {
     replyToSenderUsername: replyTo ? replyTo.senderUsername : null,
   })
 
-  await trimMessagesToLimit()
+  scheduleTrimMessagesToLimit()
   return created
 }
 
@@ -710,7 +753,7 @@ app.post(
       replyToSenderUsername: replyTo ? replyTo.senderUsername : null,
     })
 
-    await trimMessagesToLimit()
+    scheduleTrimMessagesToLimit()
 
     const formattedMessage = formatChatMessage(created, { clientRequestId })
 
