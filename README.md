@@ -1,54 +1,93 @@
-# Sandesh (Express + MongoDB backend)
+# Sandesh Backend Summary
 
-## Requirements
+This README explains how the backend is built at a high level.
+Sensitive values such as database connection strings, secrets, passwords, and private deployment details are intentionally not included.
 
-- MongoDB connection string
-- A JWT secret
+## What this backend is
 
-## Configure `CONST` env file
+The backend is a Node.js service built around Express and MongoDB. It powers:
 
-This backend loads environment variables from the file named `CONST` in this folder (as requested), plus optionally `.env`.
+- authentication
+- user/admin management
+- chat message storage
+- message moderation
+- optional real-time delivery through Socket.IO
 
-Edit: `Sandesh backend/CONST`
-- `MONGODB_URI=...`
-- `JWT_SECRET=...`
-- `ADMIN_USERNAME=Viparyas`
-- `ADMIN_PASSWORD=...`
-- `CORS_ORIGIN=...` (frontend origin)
+## Main stack
 
-## Local run
+- Node.js
+- Express
+- MongoDB with Mongoose
+- JWT authentication
+- `bcryptjs` for password hashing
+- Socket.IO
+- `helmet`
+- `cors`
+- `express-rate-limit`
+- `express-validator`
+- `xss`
+- `morgan`
 
-1. Install dependencies:
-   - `npm install`
-2. Start:
-   - `npm run start`
+## How the backend is organized
 
-Backend listens on `http://localhost:3001` by default.
+- `backend.js` is the main application file.
+- It contains the Express app setup, middleware, MongoDB models, auth logic, admin logic, chat routes, and optional socket bootstrapping.
+- `api/` contains lightweight wrappers that forward serverless requests to the same Express app.
+- Runtime settings are loaded from environment/local config sources rather than being documented with real values here.
 
-## Important endpoints
+## Core responsibilities
 
-- `POST /api/auth/login` (username + password)
-- `GET /api/auth/me`
-- `GET /api/admin/users`
-- `POST /api/admin/create-user`
-- `POST /api/admin/ban-user`
-- `DELETE /api/admin/users/:id`
-- `GET /api/chat/messages?since=<ms>`
-- `POST /api/chat/messages` (text + optional `replyToId`)
+- authenticate users with username and password
+- issue JWTs after login
+- load the current user from the token
+- protect admin-only actions
+- store and fetch chat messages
+- support message replies
+- soft-delete messages
+- manage banned users
+- disconnect banned users from live sessions when possible
 
-## Messages limit (100)
+## Data model at a high level
 
-After every send, the backend trims the chat collection so it keeps only the latest `MESSAGE_LIMIT` messages (default `100`).
+- Users include identity, normalized username, hashed password, role, banned state, and timestamps.
+- Chat messages include text, sender details, reply metadata, deleted state, and timestamps.
 
-## Real-time chat (Socket.io)
+## API shape
 
-When you run this backend as a persistent server (`node backend.js`), it also starts Socket.io on the same port.
-New messages are broadcast to all connected clients as `chat:newMessage`.
+- auth routes handle login and current-session lookup
+- admin routes handle listing users, creating users, banning/unbanning, deleting users, and resetting passwords
+- chat routes handle fetching, creating, and deleting messages
+- health routes expose a simple readiness/status response
 
-## Vercel note
+## Realtime and deployment behavior
 
-This backend exports an Express app and includes a catch-all wrapper:
-- `Sandesh backend/api/[...path].js`
+- When `backend.js` runs as a normal Node server, it creates an HTTP server and attaches Socket.IO.
+- In that mode, new messages and deletions can be pushed instantly to connected clients.
+- The `api/` wrapper files let the same app work in serverless-style deployments.
+- If a deployment cannot keep long-lived sockets, the frontend can continue to work through HTTP polling.
 
-When deploying to Vercel as serverless functions, make sure requests to `/api/*` hit that wrapper.
+## Security and safety measures
 
+- passwords are hashed before storage
+- private routes require JWT auth
+- admin actions require role checks
+- login attempts are rate-limited
+- request bodies are validated
+- chat text is sanitized
+- CORS is configurable and tightened for production use
+- production startup checks reject unsafe placeholder config for critical settings
+
+## Data retention behavior
+
+- The chat history is capped to a configured message limit.
+- Older messages are trimmed so only the newest set is kept.
+
+## Sensitive information
+
+This README intentionally does not include:
+
+- database URLs
+- JWT secrets
+- passwords
+- live tokens
+- private deployment origins
