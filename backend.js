@@ -12,6 +12,7 @@ const path = require('path')
 const http = require('http')
 const { Server } = require('socket.io')
 const { body, validationResult } = require('express-validator')
+const { startTelegramTerminalLogger } = require('./telegramTerminalLogger')
 
 const app = express()
 const isProduction = process.env.NODE_ENV === 'production'
@@ -1039,6 +1040,21 @@ if (require.main === module) {
         // eslint-disable-next-line no-console
         console.log(`Sandesh backend (HTTP+WebSocket) running on port ${CONST.PORT}`)
       })
+
+      startTelegramTerminalLogger({
+        token: CONST.TELEGRAM_BOT_TOKEN,
+        allowedUserIds: CONST.TELEGRAM_LOG_ALLOWED_USER_IDS,
+      })
+        .then((telegramTerminalLogger) => {
+          if (!telegramTerminalLogger) return
+          // eslint-disable-next-line no-console
+          console.log('Telegram terminal logger is ready for /startlog commands')
+        })
+        .catch((err) => {
+          // Do not prevent the chat server from starting if Telegram is unavailable.
+          // eslint-disable-next-line no-console
+          console.error('Telegram terminal logger failed to start:', err?.message || err)
+        })
     })
     .catch((err) => {
       // eslint-disable-next-line no-console

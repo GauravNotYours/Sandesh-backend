@@ -26,5 +26,9 @@ module.exports = {
   BCRYPT_ROUNDS: process.env.BCRYPT_ROUNDS
     ? Number(process.env.BCRYPT_ROUNDS)
     : 12,
-};
 
+  // Telegram terminal-log bot. Keep both values unset to disable this feature.
+  TELEGRAM_BOT_TOKEN: process.env.TELEGRAM_BOT_TOKEN || '',
+  // Comma-separated numeric Telegram user IDs permitted to use /startlog and /stoplog.
+  TELEGRAM_LOG_ALLOWED_USER_IDS: process.env.TELEGRAM_LOG_ALLOWED_USER_IDS || '',
+};

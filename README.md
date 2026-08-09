@@ -27,6 +27,7 @@ The backend is a Node.js service built around Express and MongoDB. It powers:
 - `express-validator`
 - `xss`
 - `morgan`
+- `telegraf` (optional Telegram terminal-log controls)
 
 ## How the backend is organized
 
@@ -91,3 +92,20 @@ This README intentionally does not include:
 - passwords
 - live tokens
 - private deployment origins
+
+## Optional Telegram terminal logging
+
+When running the persistent Node server (not a serverless deployment), you can forward
+that Node process's stdout and stderr to Telegram on demand. Add the following values
+to `.env` (see `.env.example`):
+
+```env
+TELEGRAM_BOT_TOKEN=your-bot-token
+TELEGRAM_LOG_ALLOWED_USER_IDS=your-numeric-telegram-user-id
+```
+
+Only listed Telegram user IDs can control the logger, and commands are accepted only in
+private chats with the bot. Send `/startlog` to begin receiving batched terminal output,
+`/stoplog` to stop, and `/logstatus` to check the current state. Terminal output can
+contain sensitive information; the logger masks common token, password, and MongoDB
+password patterns, but you should still grant access only to trusted administrators.
