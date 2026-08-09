@@ -29,6 +29,6 @@ module.exports = {
 
   // Telegram terminal-log bot. Keep both values unset to disable this feature.
   TELEGRAM_BOT_TOKEN: process.env.TELEGRAM_BOT_TOKEN || '',
-  // Comma-separated numeric Telegram user IDs permitted to use /startlog and /stoplog.
+  // Comma-separated Telegram user IDs (recommended) or usernames permitted to use /startlog.
   TELEGRAM_LOG_ALLOWED_USER_IDS: process.env.TELEGRAM_LOG_ALLOWED_USER_IDS || '',
 };

@@ -3,11 +3,15 @@ const { Telegraf } = require('telegraf')
 const MAX_TELEGRAM_MESSAGE_LENGTH = 3800
 const MAX_BUFFER_LENGTH = 100_000
 
-function parseAllowedUserIds(value) {
+function normalizeAllowedPrincipal(value) {
+  return String(value || '').trim().replace(/^@/, '').toLowerCase()
+}
+
+function parseAllowedPrincipals(value) {
   return new Set(
     String(value || '')
       .split(',')
-      .map((id) => id.trim())
+      .map(normalizeAllowedPrincipal)
       .filter(Boolean),
   )
 }
@@ -23,7 +27,7 @@ function normalizeTerminalOutput(chunk) {
 class TelegramTerminalLogger {
   constructor({ token, allowedUserIds, batchIntervalMs = 900 }) {
     this.token = String(token || '').trim()
-    this.allowedUserIds = parseAllowedUserIds(allowedUserIds)
+    this.allowedPrincipals = parseAllowedPrincipals(allowedUserIds)
     this.batchIntervalMs = batchIntervalMs
     this.activeChatIds = new Set()
     this.pendingOutput = ''
@@ -36,11 +40,13 @@ class TelegramTerminalLogger {
   }
 
   get isConfigured() {
-    return Boolean(this.token && this.allowedUserIds.size)
+    return Boolean(this.token && this.allowedPrincipals.size)
   }
 
   isAuthorized(ctx) {
-    return this.allowedUserIds.has(String(ctx.from?.id || ''))
+    const userId = normalizeAllowedPrincipal(ctx.from?.id)
+    const username = normalizeAllowedPrincipal(ctx.from?.username)
+    return this.allowedPrincipals.has(userId) || (username && this.allowedPrincipals.has(username))
   }
 
   async requireAuthorizedPrivateChat(ctx) {

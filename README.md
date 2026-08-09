@@ -105,7 +105,8 @@ TELEGRAM_LOG_ALLOWED_USER_IDS=your-numeric-telegram-user-id
 ```
 
 Only listed Telegram user IDs can control the logger, and commands are accepted only in
-private chats with the bot. Send `/startlog` to begin receiving batched terminal output,
-`/stoplog` to stop, and `/logstatus` to check the current state. Terminal output can
-contain sensitive information; the logger masks common token, password, and MongoDB
-password patterns, but you should still grant access only to trusted administrators.
+private chats with the bot. Numeric user IDs are recommended; usernames are also accepted
+for convenience but can change over time. Send `/startlog` to begin receiving batched
+terminal output, `/stoplog` to stop, and `/logstatus` to check the current state. Terminal
+output can contain sensitive information; the logger masks common token, password, and
+MongoDB password patterns, but you should still grant access only to trusted administrators.
