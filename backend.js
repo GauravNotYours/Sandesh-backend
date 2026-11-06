@@ -173,6 +173,11 @@ const userSchema = new mongoose.Schema(
 
 const chatMessageSchema = new mongoose.Schema(
   {
+    conversationId: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: 'Conversation',
+      default: null,
+    },
     text: {
       type: String,
       required() {
@@ -199,10 +204,26 @@ const chatMessageSchema = new mongoose.Schema(
 
 chatMessageSchema.index({ createdAt: 1 })
 chatMessageSchema.index({ deletedAt: 1 })
+chatMessageSchema.index({ conversationId: 1, createdAt: -1 })
+
+const conversationSchema = new mongoose.Schema(
+  {
+    participants: [
+      { type: mongoose.Schema.Types.ObjectId, ref: 'User', required: true },
+    ],
+    participantKey: { type: String, required: true, unique: true, index: true },
+    lastMessageAt: { type: Date, default: null },
+  },
+  { timestamps: true },
+)
+
+conversationSchema.index({ participants: 1, lastMessageAt: -1 })
 
 const User = mongoose.models.User || mongoose.model('User', userSchema)
 const ChatMessage =
   mongoose.models.ChatMessage || mongoose.model('ChatMessage', chatMessageSchema)
+const Conversation =
+  mongoose.models.Conversation || mongoose.model('Conversation', conversationSchema)
 
 async function seedAdmin() {
   const adminUsername = String(CONST.ADMIN_USERNAME || '').trim()
@@ -240,19 +261,36 @@ async function seedAdmin() {
 
 async function trimMessagesToLimit() {
   const limit = CONST.MESSAGE_LIMIT || 100
-  const count = await ChatMessage.countDocuments()
-  if (count <= limit) return
+  const conversations = await ChatMessage.aggregate([
+    { $match: { conversationId: { $type: 'objectId' } } },
+    { $group: { _id: '$conversationId', count: { $sum: 1 } } },
+    { $match: { count: { $gt: limit } } },
+  ])
 
-  const excess = count - limit
-  const toDelete = await ChatMessage.find()
+  for (const conversation of conversations) {
+    const toDelete = await ChatMessage.find({ conversationId: conversation._id })
+      .sort({ createdAt: 1 })
+      .limit(conversation.count - limit)
+      .select('_id')
+      .lean()
+    if (toDelete.length) {
+      await ChatMessage.deleteMany({ _id: { $in: toDelete.map((message) => message._id) } })
+    }
+  }
+
+  const legacyCount = await ChatMessage.countDocuments({ conversationId: null })
+  if (legacyCount <= limit) return
+
+  const legacyMessagesToDelete = await ChatMessage.find({ conversationId: null })
     .sort({ createdAt: 1 })
-    .limit(excess)
+    .limit(legacyCount - limit)
     .select('_id')
     .lean()
-
-  if (!toDelete.length) return
-  const ids = toDelete.map((d) => d._id)
-  await ChatMessage.deleteMany({ _id: { $in: ids } })
+  if (legacyMessagesToDelete.length) {
+    await ChatMessage.deleteMany({
+      _id: { $in: legacyMessagesToDelete.map((message) => message._id) },
+    })
+  }
 }
 
 function runTrimMessagesToLimit() {
@@ -373,6 +411,7 @@ function formatChatMessage(m, extras = {}) {
   const isDeleted = !!m.isDeleted
   return {
     id: m._id.toString(),
+    conversationId: m.conversationId ? m.conversationId.toString() : null,
     text: isDeleted ? '' : m.text,
     senderId: m.senderId ? m.senderId.toString() : null,
     senderUsername: m.senderUsername,
@@ -386,14 +425,119 @@ function formatChatMessage(m, extras = {}) {
   }
 }
 
+function getConversationRoom(conversationId) {
+  return `conversation:${conversationId}`
+}
+
+function getUserRoom(userId) {
+  return `user:${userId}`
+}
+
+async function emitToConversationParticipants(conversationId, eventName, payload) {
+  if (!ioInstance) return
+
+  const conversation = await Conversation.findById(conversationId).select('participants').lean()
+  if (!conversation) return
+
+  const rooms = conversation.participants.map((participantId) =>
+    getUserRoom(participantId.toString()),
+  )
+  ioInstance.to(rooms).emit(eventName, payload)
+}
+
+function getParticipantKey(firstId, secondId) {
+  return [String(firstId), String(secondId)].sort().join(':')
+}
+
+async function findConversationForUser(conversationId, userId) {
+  if (!mongoose.isValidObjectId(conversationId)) return null
+  return Conversation.findOne({
+    _id: conversationId,
+    participants: userId,
+  }).lean()
+}
+
+function formatConversation(conversation, otherUser, lastMessage) {
+  return {
+    id: conversation._id.toString(),
+    otherUser: {
+      id: otherUser._id.toString(),
+      username: otherUser.username,
+    },
+    lastMessage: lastMessage ? formatChatMessage(lastMessage) : null,
+    lastMessageAt: conversation.lastMessageAt || lastMessage?.createdAt || conversation.updatedAt,
+    createdAt: conversation.createdAt,
+  }
+}
+
+async function listConversationsForUser(userId) {
+  const conversations = await Conversation.find({ participants: userId })
+    .sort({ lastMessageAt: -1, updatedAt: -1 })
+    .lean()
+
+  if (!conversations.length) return []
+
+  const otherUserIds = conversations
+    .map((conversation) =>
+      conversation.participants.find(
+        (participantId) => participantId.toString() !== String(userId),
+      ),
+    )
+    .filter(Boolean)
+  const users = await User.find({ _id: { $in: otherUserIds } })
+    .select('_id username')
+    .lean()
+  const usersById = new Map(users.map((otherUser) => [otherUser._id.toString(), otherUser]))
+  const conversationIds = conversations.map((conversation) => conversation._id)
+  const latestMessages = await ChatMessage.aggregate([
+    { $match: { conversationId: { $in: conversationIds } } },
+    { $sort: { createdAt: -1 } },
+    { $group: { _id: '$conversationId', message: { $first: '$$ROOT' } } },
+  ])
+  const latestMessagesByConversationId = new Map(
+    latestMessages.map((result) => [result._id.toString(), result.message]),
+  )
+
+  return conversations
+    .map((conversation) => {
+      const otherUserId = conversation.participants
+        .find((participantId) => participantId.toString() !== String(userId))
+        ?.toString()
+      const otherUser = usersById.get(otherUserId)
+      if (!otherUser) return null
+      return formatConversation(
+        conversation,
+        otherUser,
+        latestMessagesByConversationId.get(conversation._id.toString()),
+      )
+    })
+    .filter(Boolean)
+}
+
 function normalizeClientRequestId(value) {
   const normalized = String(value || '').trim()
   return normalized ? normalized.slice(0, 64) : null
 }
 
-async function createMessageFromPayload({ user, text, replyToId }) {
+async function createMessageFromPayload({ user, text, replyToId, conversationId }) {
   const MAX = CONST.MAX_TEXT_LENGTH || 600
-  if (!user?.id) throw new Error('Unauthorized')
+  if (!user?.id) {
+    const err = new Error('Unauthorized')
+    err.status = 401
+    throw err
+  }
+  if (!conversationId) {
+    const err = new Error('Conversation not found')
+    err.status = 404
+    throw err
+  }
+
+  const conversation = await findConversationForUser(conversationId, user.id)
+  if (!conversation) {
+    const err = new Error('Conversation not found')
+    err.status = 404
+    throw err
+  }
 
   const t = sanitizeText(text)
   if (!t || t.length < 1 || t.length > MAX) {
@@ -404,7 +548,12 @@ async function createMessageFromPayload({ user, text, replyToId }) {
 
   let replyTo = null
   if (replyToId) {
-    replyTo = await ChatMessage.findById(replyToId).lean()
+    if (!mongoose.isValidObjectId(replyToId)) {
+      const err = new Error('Reply message not found')
+      err.status = 400
+      throw err
+    }
+    replyTo = await ChatMessage.findOne({ _id: replyToId, conversationId }).lean()
     if (!replyTo) {
       const err = new Error('Reply message not found')
       err.status = 400
@@ -413,6 +562,7 @@ async function createMessageFromPayload({ user, text, replyToId }) {
   }
 
   const created = await ChatMessage.create({
+    conversationId,
     text: t,
     senderId: user._id,
     senderUsername: user.username,
@@ -421,6 +571,10 @@ async function createMessageFromPayload({ user, text, replyToId }) {
     replyToSenderUsername: replyTo ? replyTo.senderUsername : null,
   })
 
+  await Conversation.updateOne(
+    { _id: conversationId },
+    { $set: { lastMessageAt: created.createdAt } },
+  )
   scheduleTrimMessagesToLimit()
   return created
 }
@@ -682,6 +836,138 @@ app.post(
 
 // --------- Chat (text-only) ----------
 app.get(
+  '/api/chat/conversations',
+  authMiddleware,
+  loadUserMiddleware,
+  asyncHandler(async (req, res) => {
+    const conversations = await listConversationsForUser(req.user._id)
+    return res.json({ conversations })
+  }),
+)
+
+app.post(
+  '/api/chat/conversations',
+  authMiddleware,
+  loadUserMiddleware,
+  [body('username').isString().trim().isLength({ min: 3, max: 30 })],
+  asyncHandler(async (req, res) => {
+    const errors = validationResult(req)
+    if (!errors.isEmpty()) return res.status(400).json({ errors: errors.array() })
+
+    const usernameLower = req.body.username.trim().toLowerCase()
+    const otherUser = await User.findOne({ usernameLower })
+      .select('_id username isBanned')
+      .lean()
+    if (!otherUser || otherUser.isBanned) {
+      return res.status(404).json({ message: 'User not found or unavailable' })
+    }
+
+    const userId = req.user._id.toString()
+    const otherUserId = otherUser._id.toString()
+    if (userId === otherUserId) {
+      return res.status(400).json({ message: 'You cannot start a conversation with yourself' })
+    }
+
+    const participantKey = getParticipantKey(userId, otherUserId)
+    const participants = [userId, otherUserId].sort()
+    let conversation
+    try {
+      conversation = await Conversation.findOneAndUpdate(
+        { participantKey },
+        { $setOnInsert: { participantKey, participants } },
+        { new: true, upsert: true, setDefaultsOnInsert: true },
+      ).lean()
+    } catch (err) {
+      if (err?.code !== 11000) throw err
+      conversation = await Conversation.findOne({ participantKey }).lean()
+      if (!conversation) throw err
+    }
+
+    const lastMessage = await ChatMessage.findOne({ conversationId: conversation._id })
+      .sort({ createdAt: -1 })
+      .lean()
+    return res.json({
+      conversation: formatConversation(conversation, otherUser, lastMessage),
+    })
+  }),
+)
+
+app.get(
+  '/api/chat/conversations/:conversationId/messages',
+  authMiddleware,
+  loadUserMiddleware,
+  asyncHandler(async (req, res) => {
+    const conversation = await findConversationForUser(
+      req.params.conversationId,
+      req.user._id,
+    )
+    if (!conversation) return res.status(404).json({ message: 'Conversation not found' })
+
+    const limit = CONST.MESSAGE_LIMIT || 100
+    const sinceRaw = req.query.since
+    let sinceDate = null
+    if (typeof sinceRaw !== 'undefined') {
+      const sinceNum = Number(sinceRaw)
+      if (Number.isFinite(sinceNum) && sinceNum > 0) {
+        sinceDate = new Date(sinceNum)
+      } else {
+        const date = new Date(String(sinceRaw))
+        if (!Number.isNaN(date.getTime())) sinceDate = date
+      }
+    }
+
+    const filter = { conversationId: conversation._id }
+    if (sinceDate) {
+      filter.$or = [{ createdAt: { $gt: sinceDate } }, { deletedAt: { $gt: sinceDate } }]
+    }
+    const messagesDesc = await ChatMessage.find(filter)
+      .select(
+        '_id conversationId text senderId senderUsername isDeleted deletedAt replyToMessageId replyToText replyToSenderUsername createdAt',
+      )
+      .sort({ createdAt: -1 })
+      .limit(limit)
+      .lean()
+
+    return res.json({ messages: messagesDesc.reverse().map((message) => formatChatMessage(message)) })
+  }),
+)
+
+app.post(
+  '/api/chat/conversations/:conversationId/messages',
+  authMiddleware,
+  loadUserMiddleware,
+  [
+    body('text').isString().isLength({ min: 1, max: CONST.MAX_TEXT_LENGTH || 600 }),
+    body('replyToId').optional().isMongoId(),
+    body('clientRequestId').optional().isString().isLength({ min: 1, max: 64 }),
+  ],
+  asyncHandler(async (req, res) => {
+    const errors = validationResult(req)
+    if (!errors.isEmpty()) return res.status(400).json({ errors: errors.array() })
+
+    const created = await createMessageFromPayload({
+      user: {
+        _id: req.user._id,
+        id: req.user._id.toString(),
+        username: req.user.username,
+      },
+      text: req.body.text,
+      replyToId: req.body.replyToId,
+      conversationId: req.params.conversationId,
+    })
+    const message = formatChatMessage(created, {
+      clientRequestId: normalizeClientRequestId(req.body.clientRequestId),
+    })
+    await emitToConversationParticipants(
+      req.params.conversationId,
+      'chat:newMessage',
+      message,
+    )
+    return res.json({ message })
+  }),
+)
+
+app.get(
   '/api/chat/messages',
   authMiddleware,
   loadUserMiddleware,
@@ -700,14 +986,13 @@ app.get(
       }
     }
 
-    const filter = sinceDate
-      ? {
-          $or: [{ createdAt: { $gt: sinceDate } }, { deletedAt: { $gt: sinceDate } }],
-        }
-      : {}
+    const filter = { conversationId: null }
+    if (sinceDate) {
+      filter.$or = [{ createdAt: { $gt: sinceDate } }, { deletedAt: { $gt: sinceDate } }]
+    }
     const messagesDesc = await ChatMessage.find(filter)
       .select(
-        '_id text senderId senderUsername isDeleted deletedAt replyToMessageId replyToText replyToSenderUsername createdAt',
+        '_id conversationId text senderId senderUsername isDeleted deletedAt replyToMessageId replyToText replyToSenderUsername createdAt',
       )
       .sort({ createdAt: -1 }) // newest -> oldest (we reverse below)
       .limit(limit)
@@ -778,6 +1063,13 @@ app.delete(
 
     const isOwner = msg.senderId.toString() === req.user._id.toString()
     const isAdmin = req.user.role === 'admin'
+    if (
+      msg.conversationId &&
+      !isAdmin &&
+      !(await findConversationForUser(msg.conversationId, req.user._id))
+    ) {
+      return res.status(404).json({ message: 'Message not found' })
+    }
     if (!isOwner && !isAdmin) {
       return res.status(403).json({ message: 'Not allowed' })
     }
@@ -795,9 +1087,20 @@ app.delete(
       isDeleted: true,
       deletedAt: msg.deletedAt,
       senderUsername: msg.senderUsername,
+      conversationId: msg.conversationId ? msg.conversationId.toString() : null,
     }
 
-    if (ioInstance) ioInstance.emit('chat:deleted', payload)
+    if (ioInstance) {
+      if (msg.conversationId) {
+        await emitToConversationParticipants(
+          msg.conversationId.toString(),
+          'chat:deleted',
+          payload,
+        )
+      } else {
+        ioInstance.emit('chat:deleted', payload)
+      }
+    }
     return res.json({ ok: true, message: payload })
   }),
 )
@@ -956,8 +1259,15 @@ if (require.main === module) {
         }
       })
 
-      io.on('connection', (socket) => {
+      io.on('connection', async (socket) => {
         const userKey = socket.user.id
+        try {
+          await socket.join(getUserRoom(userKey))
+        } catch (err) {
+          console.error('Failed to join authenticated user socket room:', err?.message || err)
+          socket.disconnect(true)
+          return
+        }
         if (!socketsByUserId.has(userKey)) socketsByUserId.set(userKey, new Set())
         socketsByUserId.get(userKey).add(socket.id)
 
@@ -968,23 +1278,50 @@ if (require.main === module) {
           if (set.size === 0) socketsByUserId.delete(userKey)
         })
 
-        // Optional: allow sending via websocket for real-time feel.
+        socket.on('chat:join', async (payload, ack) => {
+          try {
+            const conversationId = String(payload?.conversationId || '')
+            const conversation = await findConversationForUser(conversationId, userKey)
+            if (!conversation) {
+              if (ack) ack({ ok: false, message: 'Conversation not found' })
+              return
+            }
+
+            await socket.join(getConversationRoom(conversationId))
+            if (ack) ack({ ok: true })
+          } catch (err) {
+            if (ack) ack({ ok: false, message: err?.message || 'Failed to join conversation' })
+          }
+        })
+
+        socket.on('chat:leave', (payload) => {
+          const conversationId = String(payload?.conversationId || '')
+          if (mongoose.isValidObjectId(conversationId)) {
+            void socket.leave(getConversationRoom(conversationId))
+          }
+        })
+
         socket.on('chat:send', async (payload, ack) => {
           try {
             const user = socket.user
             const text = payload?.text
             const replyToId = payload?.replyToId || null
+            const conversationId = String(payload?.conversationId || '')
             const clientRequestId = normalizeClientRequestId(payload?.clientRequestId)
 
             const created = await createMessageFromPayload({
               user,
               text,
               replyToId,
+              conversationId,
             })
             const formattedMessage = formatChatMessage(created, { clientRequestId })
 
-            // Broadcast to everyone.
-            ioInstance.emit('chat:newMessage', formattedMessage)
+            await emitToConversationParticipants(
+              conversationId,
+              'chat:newMessage',
+              formattedMessage,
+            )
             if (ack) ack({ ok: true, message: formattedMessage })
           } catch (err) {
             if (ack) ack({ ok: false, message: err?.message || 'Failed to send' })
@@ -1008,6 +1345,14 @@ if (require.main === module) {
 
             const isOwner = msg.senderId.toString() === userId
             const isAdmin = socket.user.role === 'admin'
+            if (
+              msg.conversationId &&
+              !isAdmin &&
+              !(await findConversationForUser(msg.conversationId, userId))
+            ) {
+              if (ack) ack({ ok: false, message: 'Message not found' })
+              return
+            }
             if (!isOwner && !isAdmin) {
               if (ack) ack({ ok: false, message: 'Not allowed' })
               return
@@ -1026,9 +1371,18 @@ if (require.main === module) {
               isDeleted: true,
               deletedAt: msg.deletedAt,
               senderUsername: msg.senderUsername,
+              conversationId: msg.conversationId ? msg.conversationId.toString() : null,
             }
 
-            ioInstance.emit('chat:deleted', deletedPayload)
+            if (msg.conversationId) {
+              await emitToConversationParticipants(
+                msg.conversationId.toString(),
+                'chat:deleted',
+                deletedPayload,
+              )
+            } else {
+              ioInstance.emit('chat:deleted', deletedPayload)
+            }
             if (ack) ack({ ok: true, message: deletedPayload })
           } catch (err) {
             if (ack) ack({ ok: false, message: err?.message || 'Delete failed' })
