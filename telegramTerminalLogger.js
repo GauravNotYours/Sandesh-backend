@@ -70,9 +70,8 @@ class TelegramTerminalLogger {
       return false
     }
 
-    const userId = normalizeAllowedPrincipal(ctx.from?.id)
-    if (!/^\d+$/.test(userId) || !this.allowedPrincipals.has(userId)) {
-      await ctx.reply('A numeric Telegram user ID allowlist entry is required for device approval.')
+    if (!this.isAuthorized(ctx)) {
+      await ctx.reply('You are not authorized to approve devices.')
       return false
     }
 

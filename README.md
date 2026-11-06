@@ -172,7 +172,7 @@ In a private chat with the bot, authorized users can use:
 - `/deviceapproval <username> <device-id> approve` to approve one pending device.
 - `/deviceapproval <username> <device-id> reject` to reject one pending device.
 
-Device approval commands are accepted only in private chats and require the sender's numeric Telegram user ID to be present in `TELEGRAM_LOG_ALLOWED_USER_IDS`. Usernames in the allowlist are not sufficient for device approval. Keep this allowlist restricted to trusted administrators.
+Device approval commands are accepted only in private chats and require the sender's numeric Telegram user ID or Telegram username to be present in `TELEGRAM_LOG_ALLOWED_USER_IDS`. Numeric IDs are safer because usernames can change or be reassigned. Keep this allowlist restricted to trusted administrators.
 
 The pending-device list includes each account username and unique device ID. Copy both values exactly into an approve or reject command. Telegram approval resets the encryption key IDs for that account's conversations so the newly approved device can establish fresh keys. The new device cannot recover old keys from Telegram or the backend; existing encrypted history may become unreadable on clients that replace their cached keys. Prefer approval from an already approved browser when preserving encrypted history matters.
 
