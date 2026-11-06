@@ -644,6 +644,89 @@ async function createMessageFromPayload({ user, text, replyToId, conversationId 
   return created
 }
 
+function createTelegramDeviceApprovalHandlers() {
+  async function findAccount(username) {
+    const usernameLower = String(username || '').trim().toLowerCase()
+    if (!usernameLower) {
+      const error = new Error('Username is required')
+      error.status = 400
+      throw error
+    }
+
+    const user = await User.findOne({ usernameLower }).select('_id username').lean()
+    if (!user) {
+      const error = new Error('Account not found')
+      error.status = 404
+      throw error
+    }
+    return user
+  }
+
+  return {
+    async listPending() {
+      const devices = await CryptoDevice.find({ status: 'pending' })
+        .select('userId deviceId createdAt')
+        .populate('userId', 'username')
+        .sort({ createdAt: 1 })
+        .lean()
+      return devices.map((device) => ({
+        username: device.userId?.username || '[deleted account]',
+        deviceId: device.deviceId,
+        createdAt: device.createdAt,
+      }))
+    },
+
+    async approve(username, deviceId) {
+      const user = await findAccount(username)
+      const device = await CryptoDevice.findOne({
+        userId: user._id,
+        deviceId: String(deviceId || '').toLowerCase(),
+        status: 'pending',
+      })
+      if (!device) return { count: 0, username: user.username }
+
+      device.status = 'approved'
+      device.approvedAt = new Date()
+      await device.save()
+      try {
+        const keyReset = await Conversation.updateMany(
+          { participants: user._id },
+          { $set: { encryptionKeyId: null } },
+        )
+        return {
+          count: 1,
+          username: user.username,
+          deviceId: device.deviceId,
+          conversationCount: keyReset.modifiedCount,
+        }
+      } catch (error) {
+        try {
+          device.status = 'pending'
+          device.approvedAt = null
+          await device.save()
+        } catch (rollbackError) {
+          error.rollbackError = rollbackError
+        }
+        throw error
+      }
+    },
+
+    async reject(username, deviceId) {
+      const user = await findAccount(username)
+      const result = await CryptoDevice.deleteOne({
+        userId: user._id,
+        deviceId: String(deviceId || '').toLowerCase(),
+        status: 'pending',
+      })
+      return {
+        count: result.deletedCount,
+        username: user.username,
+        deviceId: String(deviceId || '').toLowerCase(),
+      }
+    },
+  }
+}
+
 // --------- Routes ----------
 app.get('/api/health', (req, res) =>
   res.json({
@@ -1719,6 +1802,7 @@ if (require.main === module) {
       startTelegramTerminalLogger({
         token: CONST.TELEGRAM_BOT_TOKEN,
         allowedUserIds: CONST.TELEGRAM_LOG_ALLOWED_USER_IDS,
+        deviceApproval: createTelegramDeviceApprovalHandlers(),
       })
         .then((telegramTerminalLogger) => {
           if (!telegramTerminalLogger) return

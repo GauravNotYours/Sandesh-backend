@@ -25,9 +25,10 @@ function normalizeTerminalOutput(chunk) {
 }
 
 class TelegramTerminalLogger {
-  constructor({ token, allowedUserIds, batchIntervalMs = 900 }) {
+  constructor({ token, allowedUserIds, deviceApproval, batchIntervalMs = 900 }) {
     this.token = String(token || '').trim()
     this.allowedPrincipals = parseAllowedPrincipals(allowedUserIds)
+    this.deviceApproval = deviceApproval
     this.batchIntervalMs = batchIntervalMs
     this.activeChatIds = new Set()
     this.pendingOutput = ''
@@ -57,6 +58,21 @@ class TelegramTerminalLogger {
 
     if (ctx.chat?.type !== 'private') {
       await ctx.reply('For safety, terminal logging can only be controlled in a private chat.')
+      return false
+    }
+
+    return true
+  }
+
+  async requireAuthorizedDeviceAdmin(ctx) {
+    if (ctx.chat?.type !== 'private') {
+      await ctx.reply('Device approval commands are only available in a private chat.')
+      return false
+    }
+
+    const userId = normalizeAllowedPrincipal(ctx.from?.id)
+    if (!/^\d+$/.test(userId) || !this.allowedPrincipals.has(userId)) {
+      await ctx.reply('A numeric Telegram user ID allowlist entry is required for device approval.')
       return false
     }
 
@@ -178,6 +194,79 @@ class TelegramTerminalLogger {
           ? 'Terminal logging is active for this chat.'
           : 'Terminal logging is stopped for this chat.',
       )
+    })
+    this.bot.command('deviceapproval', async (ctx) => {
+      if (!(await this.requireAuthorizedDeviceAdmin(ctx))) return
+      if (!this.deviceApproval) {
+        await ctx.reply('Device approval is not available on this server.')
+        return
+      }
+
+      const args = String(ctx.message?.text || '').trim().split(/\s+/).slice(1)
+      try {
+        if (args.length === 1 && args[0].toLowerCase() === 'list') {
+          const devices = await this.deviceApproval.listPending()
+          if (!devices.length) {
+            await ctx.reply('There are no devices waiting for approval.')
+            return
+          }
+
+          const lines = devices.map(
+            (device) =>
+              `${device.username} | ${device.deviceId} | requested ${new Date(device.createdAt).toISOString()}`,
+          )
+          let chunk = 'Devices waiting for approval:\n'
+          for (const line of lines) {
+            if (chunk.length + line.length + 1 > MAX_TELEGRAM_MESSAGE_LENGTH) {
+              await ctx.reply(chunk)
+              chunk = ''
+            }
+            chunk += `${line}\n`
+          }
+          if (chunk) await ctx.reply(chunk)
+          return
+        }
+
+        if (
+          args.length !== 3 ||
+          !/^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(
+            args[1],
+          ) ||
+          !['approve', 'reject'].includes(args[2].toLowerCase())
+        ) {
+          await ctx.reply(
+            'Usage:\n/deviceapproval list\n/deviceapproval <username> <device-id> approve\n/deviceapproval <username> <device-id> reject',
+          )
+          return
+        }
+
+        const username = args[0]
+        const deviceId = args[1].toLowerCase()
+        const action = args[2].toLowerCase()
+        const result =
+          action === 'approve'
+            ? await this.deviceApproval.approve(username, deviceId)
+            : await this.deviceApproval.reject(username, deviceId)
+        if (!result.count) {
+          await ctx.reply(`No pending device ${deviceId} found for ${username}.`)
+          return
+        }
+
+        if (action === 'approve') {
+          await ctx.reply(
+            `Approved device ${result.deviceId} for ${result.username} and reset encryption keys for ${result.conversationCount} conversation(s). Older encrypted history may no longer be readable.`,
+          )
+        } else {
+          await ctx.reply(`Rejected device ${result.deviceId} for ${result.username}.`)
+        }
+      } catch (error) {
+        this.writeInternalError(error)
+        await ctx.reply(
+          error?.status === 404
+            ? `Account "${args[0] || ''}" was not found.`
+            : 'Device approval failed. Check backend logs for details.',
+        )
+      }
     })
     this.bot.catch((error) => this.writeInternalError(error))
 

@@ -159,14 +159,21 @@ Socket connections authenticate with the user's JWT. Conversation room membershi
 - A compromised browser, device, frontend origin, or an account session can expose plaintext or keys.
 - The backend's legacy shared-room message creation endpoint is disabled; legacy history may still be returned by its read endpoint.
 
-## Optional Telegram terminal logging
+## Telegram terminal logging and device approval
 
 Terminal logging is disabled unless both `TELEGRAM_BOT_TOKEN` and `TELEGRAM_LOG_ALLOWED_USER_IDS` are configured. It is intended for the persistent Node server, not a serverless deployment.
 
-In a private chat with the bot, an authorized Telegram user can use:
+In a private chat with the bot, authorized users can use:
 
 - `/startlog` to begin receiving batched process output.
 - `/stoplog` to stop forwarding output.
 - `/logstatus` to check the current state.
+- `/deviceapproval list` to list pending devices across accounts.
+- `/deviceapproval <username> <device-id> approve` to approve one pending device.
+- `/deviceapproval <username> <device-id> reject` to reject one pending device.
 
-Only allow trusted administrators. Output can contain sensitive operational details; common token, password, authorization, and MongoDB password patterns are masked, but masking cannot guarantee that all secrets are removed.
+Device approval commands are accepted only in private chats and require the sender's numeric Telegram user ID to be present in `TELEGRAM_LOG_ALLOWED_USER_IDS`. Usernames in the allowlist are not sufficient for device approval. Keep this allowlist restricted to trusted administrators.
+
+The pending-device list includes each account username and unique device ID. Copy both values exactly into an approve or reject command. Telegram approval resets the encryption key IDs for that account's conversations so the newly approved device can establish fresh keys. The new device cannot recover old keys from Telegram or the backend; existing encrypted history may become unreadable on clients that replace their cached keys. Prefer approval from an already approved browser when preserving encrypted history matters.
+
+Terminal output can contain sensitive operational details; common token, password, authorization, and MongoDB password patterns are masked, but masking cannot guarantee that all secrets are removed.
