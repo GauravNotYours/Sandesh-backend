@@ -6,7 +6,6 @@ const mongoose = require('mongoose')
 const bcrypt = require('bcryptjs')
 const jwt = require('jsonwebtoken')
 const morgan = require('morgan')
-const xss = require('xss')
 const dotenv = require('dotenv')
 const path = require('path')
 const http = require('http')
@@ -183,7 +182,7 @@ const chatMessageSchema = new mongoose.Schema(
       required() {
         return !this.isDeleted
       },
-      maxlength: CONST.MAX_TEXT_LENGTH || 600,
+      maxlength: Math.ceil(((CONST.MAX_TEXT_LENGTH || 600) * 4 + 16) / 3) * 4 + 25,
       default: '',
     },
     senderId: { type: mongoose.Schema.Types.ObjectId, ref: 'User', required: true },
@@ -213,6 +212,7 @@ const conversationSchema = new mongoose.Schema(
     ],
     participantKey: { type: String, required: true, unique: true, index: true },
     lastMessageAt: { type: Date, default: null },
+    encryptionKeyId: { type: String, default: null },
   },
   { timestamps: true },
 )
@@ -224,6 +224,46 @@ const ChatMessage =
   mongoose.models.ChatMessage || mongoose.model('ChatMessage', chatMessageSchema)
 const Conversation =
   mongoose.models.Conversation || mongoose.model('Conversation', conversationSchema)
+
+const cryptoDeviceSchema = new mongoose.Schema(
+  {
+    userId: { type: mongoose.Schema.Types.ObjectId, ref: 'User', required: true, index: true },
+    deviceId: { type: String, required: true },
+    publicKeyJwk: { type: mongoose.Schema.Types.Mixed, required: true },
+    status: { type: String, enum: ['pending', 'approved'], required: true },
+    approvedAt: { type: Date, default: null },
+  },
+  { timestamps: { createdAt: true, updatedAt: true } },
+)
+
+cryptoDeviceSchema.index({ userId: 1, deviceId: 1 }, { unique: true })
+
+const conversationKeyEnvelopeSchema = new mongoose.Schema(
+  {
+    conversationId: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: 'Conversation',
+      required: true,
+    },
+    deviceId: { type: String, required: true },
+    keyId: { type: String, required: true },
+    ephemeralPublicKeyJwk: { type: mongoose.Schema.Types.Mixed, required: true },
+    iv: { type: String, required: true, maxlength: 64 },
+    ciphertext: { type: String, required: true, maxlength: 1024 },
+  },
+  { timestamps: true },
+)
+
+conversationKeyEnvelopeSchema.index(
+  { conversationId: 1, deviceId: 1 },
+  { unique: true },
+)
+
+const CryptoDevice =
+  mongoose.models.CryptoDevice || mongoose.model('CryptoDevice', cryptoDeviceSchema)
+const ConversationKeyEnvelope =
+  mongoose.models.ConversationKeyEnvelope ||
+  mongoose.model('ConversationKeyEnvelope', conversationKeyEnvelopeSchema)
 
 async function seedAdmin() {
   const adminUsername = String(CONST.ADMIN_USERNAME || '').trim()
@@ -401,12 +441,6 @@ function requireAdmin(req, res, next) {
   return next()
 }
 
-function sanitizeText(input) {
-  const s = String(input ?? '')
-  // Remove any HTML/JS. Messages are text-only.
-  return xss(s, { whiteList: [] }).trim().replace(/\s+/g, ' ')
-}
-
 function formatChatMessage(m, extras = {}) {
   const isDeleted = !!m.isDeleted
   return {
@@ -431,6 +465,38 @@ function getConversationRoom(conversationId) {
 
 function getUserRoom(userId) {
   return `user:${userId}`
+}
+
+function isValidPublicKeyJwk(value) {
+  return (
+    value &&
+    value.kty === 'EC' &&
+    value.crv === 'P-256' &&
+    typeof value.x === 'string' &&
+    /^[A-Za-z0-9_-]{43}$/.test(value.x) &&
+    typeof value.y === 'string' &&
+    /^[A-Za-z0-9_-]{43}$/.test(value.y)
+  )
+}
+
+function isValidEncryptedMessage(value) {
+  const maximumLength =
+    Math.ceil(((CONST.MAX_TEXT_LENGTH || 600) * 4 + 16) / 3) * 4 + 25
+  return (
+    typeof value === 'string' &&
+    value.length <= maximumLength &&
+    /^e2ee:v1:[A-Za-z0-9_-]{16}:[A-Za-z0-9_-]{20,3224}$/.test(value)
+  )
+}
+
+function formatCryptoDevice(device) {
+  return {
+    userId: device.userId.toString(),
+    deviceId: device.deviceId,
+    publicKeyJwk: device.publicKeyJwk,
+    status: device.status,
+    createdAt: device.createdAt,
+  }
 }
 
 async function emitToConversationParticipants(conversationId, eventName, payload) {
@@ -520,7 +586,6 @@ function normalizeClientRequestId(value) {
 }
 
 async function createMessageFromPayload({ user, text, replyToId, conversationId }) {
-  const MAX = CONST.MAX_TEXT_LENGTH || 600
   if (!user?.id) {
     const err = new Error('Unauthorized')
     err.status = 401
@@ -539,9 +604,9 @@ async function createMessageFromPayload({ user, text, replyToId, conversationId 
     throw err
   }
 
-  const t = sanitizeText(text)
-  if (!t || t.length < 1 || t.length > MAX) {
-    const err = new Error('Text is required')
+  const t = String(text || '')
+  if (!isValidEncryptedMessage(t)) {
+    const err = new Error('Messages must be encrypted by a supported client')
     err.status = 400
     throw err
   }
@@ -567,7 +632,7 @@ async function createMessageFromPayload({ user, text, replyToId, conversationId 
     senderId: user._id,
     senderUsername: user.username,
     replyToMessageId: replyTo ? replyTo._id : null,
-    replyToText: replyTo ? String(replyTo.text).slice(0, 160) : null,
+    replyToText: null,
     replyToSenderUsername: replyTo ? replyTo.senderUsername : null,
   })
 
@@ -892,6 +957,292 @@ app.post(
   }),
 )
 
+app.post(
+  '/api/crypto/devices/register',
+  authMiddleware,
+  loadUserMiddleware,
+  [
+    body('deviceId').isUUID(),
+    body('publicKeyJwk').custom(isValidPublicKeyJwk),
+  ],
+  asyncHandler(async (req, res) => {
+    const errors = validationResult(req)
+    if (!errors.isEmpty()) return res.status(400).json({ errors: errors.array() })
+
+    const deviceId = req.body.deviceId.toLowerCase()
+    let device = await CryptoDevice.findOne({
+      userId: req.user._id,
+      deviceId,
+    })
+    if (device) {
+      if (
+        device.publicKeyJwk.x !== req.body.publicKeyJwk.x ||
+        device.publicKeyJwk.y !== req.body.publicKeyJwk.y
+      ) {
+        return res.status(409).json({
+          message: 'This device ID is already registered to another encryption key',
+          code: 'DEVICE_KEY_MISMATCH',
+        })
+      }
+    } else {
+      const hasApprovedDevice = await CryptoDevice.exists({
+        userId: req.user._id,
+        status: 'approved',
+      })
+      try {
+        device = await CryptoDevice.create({
+          userId: req.user._id,
+          deviceId,
+          publicKeyJwk: req.body.publicKeyJwk,
+          status: hasApprovedDevice ? 'pending' : 'approved',
+          approvedAt: hasApprovedDevice ? null : new Date(),
+        })
+      } catch (err) {
+        if (err?.code !== 11000) throw err
+        device = await CryptoDevice.findOne({ userId: req.user._id, deviceId })
+        if (
+          !device ||
+          device.publicKeyJwk.x !== req.body.publicKeyJwk.x ||
+          device.publicKeyJwk.y !== req.body.publicKeyJwk.y
+        ) {
+          return res.status(409).json({
+            message: 'This device ID is already registered to another encryption key',
+            code: 'DEVICE_KEY_MISMATCH',
+          })
+        }
+      }
+    }
+
+    return res.json({
+      device: formatCryptoDevice(device),
+      approved: device.status === 'approved',
+    })
+  }),
+)
+
+app.get(
+  '/api/crypto/devices/pending',
+  authMiddleware,
+  loadUserMiddleware,
+  asyncHandler(async (req, res) => {
+    const devices = await CryptoDevice.find({
+      userId: req.user._id,
+      status: 'pending',
+    })
+      .sort({ createdAt: 1 })
+      .lean()
+    return res.json({
+      devices: devices.map((device) => ({
+        deviceId: device.deviceId,
+        createdAt: device.createdAt,
+      })),
+    })
+  }),
+)
+
+app.get(
+  '/api/crypto/devices',
+  authMiddleware,
+  loadUserMiddleware,
+  asyncHandler(async (req, res) => {
+    const devices = await CryptoDevice.find({ userId: req.user._id })
+      .sort({ createdAt: 1 })
+      .lean()
+    return res.json({
+      devices: devices.map((device) => ({
+        deviceId: device.deviceId,
+        status: device.status,
+        createdAt: device.createdAt,
+      })),
+    })
+  }),
+)
+
+app.post(
+  '/api/crypto/devices/:deviceId/approve',
+  authMiddleware,
+  loadUserMiddleware,
+  [body('sourceDeviceId').isUUID()],
+  asyncHandler(async (req, res) => {
+    const errors = validationResult(req)
+    if (!errors.isEmpty()) return res.status(400).json({ errors: errors.array() })
+
+    const targetDevice = await CryptoDevice.findOne({
+      userId: req.user._id,
+      deviceId: req.params.deviceId.toLowerCase(),
+      status: 'pending',
+    })
+    if (!targetDevice) return res.status(404).json({ message: 'Pending device not found' })
+
+    const sourceDevice = await CryptoDevice.findOne({
+      userId: req.user._id,
+      deviceId: req.body.sourceDeviceId.toLowerCase(),
+      status: 'approved',
+    })
+    if (!sourceDevice) {
+      return res.status(403).json({ message: 'An approved device is required to approve this device' })
+    }
+
+    targetDevice.status = 'approved'
+    targetDevice.approvedAt = new Date()
+    await targetDevice.save()
+    return res.json({ device: formatCryptoDevice(targetDevice) })
+  }),
+)
+
+app.get(
+  '/api/chat/conversations/:conversationId/keys',
+  authMiddleware,
+  loadUserMiddleware,
+  asyncHandler(async (req, res) => {
+    const { conversationId } = req.params
+    const deviceId = String(req.query.deviceId || '').toLowerCase()
+    if (!/^[0-9a-f-]{36}$/.test(deviceId)) {
+      return res.status(400).json({ message: 'Valid deviceId is required' })
+    }
+
+    const conversation = await findConversationForUser(conversationId, req.user._id)
+    if (!conversation) return res.status(404).json({ message: 'Conversation not found' })
+
+    const currentDevice = await CryptoDevice.findOne({
+      userId: req.user._id,
+      deviceId,
+      status: 'approved',
+    }).lean()
+    if (!currentDevice) {
+      return res.status(403).json({ message: 'This device is not approved for encryption' })
+    }
+
+    const devices = await CryptoDevice.find({
+      userId: { $in: conversation.participants },
+      status: 'approved',
+    })
+      .select('userId deviceId publicKeyJwk status createdAt')
+      .lean()
+    const envelope = await ConversationKeyEnvelope.findOne({
+      conversationId: conversation._id,
+      deviceId,
+    }).lean()
+    const envelopeDeviceIds = await ConversationKeyEnvelope.find({
+      conversationId: conversation._id,
+      keyId: conversation.encryptionKeyId,
+    })
+      .distinct('deviceId')
+
+    return res.json({
+      keyId: conversation.encryptionKeyId || null,
+      devices: devices.map(formatCryptoDevice),
+      envelopeDeviceIds,
+      envelope:
+        envelope && envelope.keyId === conversation.encryptionKeyId
+          ? {
+              keyId: envelope.keyId,
+              ephemeralPublicKeyJwk: envelope.ephemeralPublicKeyJwk,
+              iv: envelope.iv,
+              ciphertext: envelope.ciphertext,
+            }
+          : null,
+    })
+  }),
+)
+
+app.post(
+  '/api/chat/conversations/:conversationId/keys/claim',
+  authMiddleware,
+  loadUserMiddleware,
+  [
+    body('deviceId').isUUID(),
+    body('keyId').isUUID(),
+  ],
+  asyncHandler(async (req, res) => {
+    const errors = validationResult(req)
+    if (!errors.isEmpty()) return res.status(400).json({ errors: errors.array() })
+
+    const conversation = await findConversationForUser(
+      req.params.conversationId,
+      req.user._id,
+    )
+    if (!conversation) return res.status(404).json({ message: 'Conversation not found' })
+
+    const device = await CryptoDevice.findOne({
+      userId: req.user._id,
+      deviceId: req.body.deviceId.toLowerCase(),
+      status: 'approved',
+    }).lean()
+    if (!device) return res.status(403).json({ message: 'This device is not approved' })
+
+    const result = await Conversation.updateOne(
+      { _id: conversation._id, encryptionKeyId: null },
+      { $set: { encryptionKeyId: req.body.keyId.toLowerCase() } },
+    )
+    const current = await Conversation.findById(conversation._id)
+      .select('encryptionKeyId')
+      .lean()
+    return res.json({
+      keyId: current?.encryptionKeyId || null,
+      claimed: result.modifiedCount === 1,
+    })
+  }),
+)
+
+app.post(
+  '/api/chat/conversations/:conversationId/keys/envelopes',
+  authMiddleware,
+  loadUserMiddleware,
+  [
+    body('sourceDeviceId').isUUID(),
+    body('targetDeviceId').isUUID(),
+    body('keyId').isUUID(),
+    body('ephemeralPublicKeyJwk').custom(isValidPublicKeyJwk),
+    body('iv').matches(/^[A-Za-z0-9_-]{16}$/),
+    body('ciphertext').matches(/^[A-Za-z0-9_-]{60,100}$/),
+  ],
+  asyncHandler(async (req, res) => {
+    const errors = validationResult(req)
+    if (!errors.isEmpty()) return res.status(400).json({ errors: errors.array() })
+
+    const conversation = await findConversationForUser(
+      req.params.conversationId,
+      req.user._id,
+    )
+    if (!conversation) return res.status(404).json({ message: 'Conversation not found' })
+    if (conversation.encryptionKeyId !== req.body.keyId.toLowerCase()) {
+      return res.status(409).json({ message: 'Conversation encryption key changed' })
+    }
+
+    const sourceDevice = await CryptoDevice.findOne({
+      userId: req.user._id,
+      deviceId: req.body.sourceDeviceId.toLowerCase(),
+      status: 'approved',
+    }).lean()
+    if (!sourceDevice) return res.status(403).json({ message: 'Source device is not approved' })
+
+    const targetDevice = await CryptoDevice.findOne({
+      deviceId: req.body.targetDeviceId.toLowerCase(),
+      userId: { $in: conversation.participants },
+      status: 'approved',
+    }).lean()
+    if (!targetDevice) return res.status(404).json({ message: 'Approved target device not found' })
+
+    await ConversationKeyEnvelope.findOneAndUpdate(
+      {
+        conversationId: conversation._id,
+        deviceId: targetDevice.deviceId,
+      },
+      {
+        $set: {
+          keyId: conversation.encryptionKeyId,
+          ephemeralPublicKeyJwk: req.body.ephemeralPublicKeyJwk,
+          iv: req.body.iv,
+          ciphertext: req.body.ciphertext,
+        },
+      },
+      { upsert: true, new: true, setDefaultsOnInsert: true },
+    )
+    return res.json({ ok: true })
+  }),
+)
+
 app.get(
   '/api/chat/conversations/:conversationId/messages',
   authMiddleware,
@@ -937,7 +1288,12 @@ app.post(
   authMiddleware,
   loadUserMiddleware,
   [
-    body('text').isString().isLength({ min: 1, max: CONST.MAX_TEXT_LENGTH || 600 }),
+    body('text')
+      .isString()
+      .isLength({
+        min: 1,
+        max: Math.ceil(((CONST.MAX_TEXT_LENGTH || 600) * 4 + 16) / 3) * 4 + 25,
+      }),
     body('replyToId').optional().isMongoId(),
     body('clientRequestId').optional().isString().isLength({ min: 1, max: 64 }),
   ],
@@ -1010,46 +1366,11 @@ app.post(
   '/api/chat/messages',
   authMiddleware,
   loadUserMiddleware,
-  [
-    body('text').isString().isLength({ min: 1, max: CONST.MAX_TEXT_LENGTH || 600 }),
-    body('replyToId').optional().isString().isLength({ min: 10 }),
-    body('clientRequestId').optional().isString().isLength({ min: 1, max: 64 }),
-  ],
-  asyncHandler(async (req, res) => {
-    const errors = validationResult(req)
-    if (!errors.isEmpty()) return res.status(400).json({ errors: errors.array() })
-
-    const text = sanitizeText(req.body.text)
-    if (!text) return res.status(400).json({ message: 'Text is required' })
-
-    const clientRequestId = normalizeClientRequestId(req.body.clientRequestId)
-    const replyToIdRaw = req.body.replyToId
-    let replyTo = null
-    if (replyToIdRaw) {
-      replyTo = await ChatMessage.findById(replyToIdRaw).lean()
-      if (!replyTo) return res.status(400).json({ message: 'Reply message not found' })
-    }
-
-    const created = await ChatMessage.create({
-      text,
-      senderId: req.user._id,
-      senderUsername: req.user.username,
-      replyToMessageId: replyTo ? replyTo._id : null,
-      replyToText: replyTo ? String(replyTo.text).slice(0, 160) : null,
-      replyToSenderUsername: replyTo ? replyTo.senderUsername : null,
+  (req, res) => {
+    return res.status(410).json({
+      message: 'Shared plaintext messaging is disabled. Start a private encrypted conversation.',
     })
-
-    scheduleTrimMessagesToLimit()
-
-    const formattedMessage = formatChatMessage(created, { clientRequestId })
-
-    // Real-time: broadcast to all connected websocket clients (persistent server mode).
-    if (ioInstance) {
-      ioInstance.emit('chat:newMessage', formattedMessage)
-    }
-
-    return res.json({ message: formattedMessage })
-  }),
+  },
 )
 
 app.delete(
